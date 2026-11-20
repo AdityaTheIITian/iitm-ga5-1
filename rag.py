@@ -54,7 +54,7 @@ A = {
     7: ("Rendezvous hashing", [r"rendezvous", r"highest random weight", r"\bhrw\b"], []),
     8: ("Vector clocks", [r"vector clock", r"version vector"], []),
     9: ("Hybrid logical clocks", [r"hybrid logical clock", r"\bhlc\b"], []),
-    10: ("SGD", [r"\bsgd\b", r"stochastic gradient"], []),
+    10: ("SGD", [r"stochastic gradient descent", r"\bsgd\b", r"stochastic gradient"], []),
     11: ("AdamW", [r"adamw", r"\badam\b"], []),
     12: ("Transformer encoder", [r"transformer encoder", r"\bencoders?\b"], [r"transformer"]),
     13: ("Autoregressive decoder", [r"autoregressive", r"auto-regressive", r"decoder"], [r"transformer"]),
@@ -109,6 +109,7 @@ def subject_hits(qn):
             if m:
                 scores[i] = 1.0
                 ignore.update(toks(m.group(0)))
+                ignore.update(toks(A[i][0]))
         if scores[i] == 0:
             for r in weak:
                 m = r.search(qn)
@@ -124,10 +125,10 @@ whose how why when where does do did can could would should will it its this tha
 then there their they them used use using uses value values default given specified specific many much number kind type
 tell me explain describe define according passage knowledge base kb algorithm protocol method technique mechanism
 system approach pattern model between compare comparison difference differ versus vs both each also if not no
-whether has have having required require requires configured configure policy strategy max maximum""".split()))
+whether has have having required require requires configured configure policy strategy max maximum regarding concerning relating related respect""".split()))
 
 GROUPS = [
-    set(map(stem, "timeout interval duration latency delay wait window period timer deadline ttl time long often".split())),
+    set(map(stem, "timeout interval duration latency delay wait window period timer deadline ttl time".split())),
     set(map(stem, "threshold ratio saturation utilization limit capacity burst skew exceed cross surpass fill level".split())),
     set(map(stem, "port listen bind socket".split())),
     set(map(stem, "quorum majority acknowledge acknowledgment ack".split())),
@@ -144,7 +145,10 @@ INJ = re.compile(
     r"everything|guideline)|system prompt|you are now|new instructions?|developer mode|jailbreak|\bact as\b|"
     r"pretend (to be|you)|reveal (your|the) (prompt|instruction|system)|(print|repeat|show) (your|the) "
     r"(prompt|instruction)|respond (only )?with|output (only )?(the following|exactly)|answer (only )?with|"
-    r"<\s*/?\s*(system|assistant|user|instructions?)\s*>|\[\s*(system|inst|instruction)s?\s*\]|###|---|\bsay\s+['\"]",
+    r"<\s*/?\s*(system|assistant|user|instructions?)\s*>|\[\s*(system|inst|instruction)s?\s*\]|###|---|\bsay\s+['\"]|\b(append|prepend)\b|(begin|start|end|finish) (your|the) (answer|response|reply)|"
+    r"(include|add|insert|write|print) the (word|phrase|string|text|token)|reply with|note to (the )?(ai|assistant|model|system)|"
+    r"system override|instead of answering|do not (answer|use|follow)|\bignore\b.{0,20}\b(above|previous|prior|earlier)|"
+    r"you must (now )?(say|answer|respond|output)|always (say|answer|respond|output)",
     re.I)
 
 
@@ -232,6 +236,8 @@ class Engine:
         got = 0
         for k in keys:
             ok = k in ss
+            if k in ("long", "ofte"):  # "how long / how often" -> needs a time value
+                ok = has_ms
             if not ok and k in NUMERIC_ATTR:
                 ok = has_digit
             if not ok:
@@ -292,36 +298,53 @@ class Engine:
 
         cands = strong if compare else [int(order[0])] + ([int(order[1])] if rank[order[1]] >= 0.92 * rank[order[0]] else [])
 
-        picks = []  # (passage, sentence idx, coverage)
+        picks = []  # (passage, [sentence idxs], coverage)
         for pi in cands:
-            idxs = np.where(self.owner == pi)[0]
-            best, best_sc = None, -1
+            idxs = list(np.where(self.owner == pi)[0])
+            best, best_sc, best_cov = None, -1, 0.0
             for si in idxs:
                 cov = self._coverage(keys, si)
-                sc = 0.45 * ds[si] + 0.25 * min(1.0, lex_s[si] * 1.5) + 0.30 * cov
+                sc = 0.60 * cov + 0.25 * ds[si] + 0.15 * min(1.0, lex_s[si] * 1.5)
+                if needs_num and re.search(r"\d", self.sents[si]):
+                    sc += 0.2
                 if sc > best_sc:
                     best, best_sc, best_cov = si, sc, cov
             if best is None:
                 continue
-            digit_ok = (not needs_num) or bool(re.search(r"\d", self.sents[best]))
-            need = 1.0 if len(keys) == 1 else self.cov_min
+            chosen = [best]
+            # cross-sentence facts: add up to 2 neighbours that cover keys the best sentence misses
+            if keys and best_cov < 1.0:
+                for _ in range(2):
+                    missing = [k for k in keys if self._coverage([k], chosen[0]) < 1
+                               and all(self._coverage([k], c) < 1 for c in chosen)]
+                    if not missing:
+                        break
+                    cand = max((i for i in idxs if i not in chosen),
+                               key=lambda i: (self._coverage(missing, i), ds[i]), default=None)
+                    if cand is None or self._coverage(missing, cand) == 0:
+                        break
+                    chosen.append(cand)
+            chosen.sort()
             if keys:
-                good = best_cov >= need and digit_ok
-            else:  # bare "tell me about X": allow only with a known subject
-                good = has_subject
+                cov = float(np.mean([any(self._coverage([k], c) >= 1 for c in chosen) for k in keys]))
+            else:
+                cov = 1.0
+            digit_ok = (not needs_num) or any(re.search(r"\d", self.sents[c]) for c in chosen)
+            need = 1.0 if len(keys) == 1 else self.cov_min
+            good = (cov >= need and digit_ok) if keys else has_subject
             if good:
-                picks.append((pi, best, best_cov))
+                picks.append((pi, chosen, cov))
 
         if not picks:
             return self._abstain(rank.max())
 
         if not keys:
-            picks = [(pi, int(np.where(self.owner == pi)[0][0]), 1.0) for pi, _, _ in picks]
+            picks = [(pi, [int(np.where(self.owner == pi)[0][0])], 1.0) for pi, _, _ in picks]
 
         if compare and len(picks) > 1:
-            answer = " ".join(f"{A[pi][0]}: {self.sents[si]}" for pi, si, _ in picks)
+            answer = " ".join(f"{A[pi][0]}: " + " ".join(self.sents[c] for c in cs) for pi, cs, _ in picks)
         else:
-            answer = self.sents[picks[0][1]]
+            answer = " ".join(self.sents[c] for c in picks[0][1])
 
         used = [p[0] for p in picks]
         final = rank.copy()
