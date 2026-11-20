@@ -37,11 +37,12 @@ async def query(request: Request):
     q = q if isinstance(q, str) else ""
     t0 = time.time()
     try:
-        result = await asyncio.wait_for(run_in_threadpool(engine.answer, q, body.get("top_k", 3)), timeout=7.0)
+        result = await asyncio.wait_for(run_in_threadpool(engine.answer, q, body.get("top_k", 3), True), timeout=7.0)
     except Exception:
         log.exception("query failed")
         result = ABSTAIN
     # one log line per probe so the Render logs show exactly what the grader asked and what we returned
+    dbg = result.pop("_dbg", "")
     print(f"[probe] {time.time() - t0:.2f}s Q={q[:200]!r} -> A={str(result['answer'])[:120]!r} "
-          f"src={result['sources']} conf={result['confidence']}", flush=True)
+          f"src={result['sources']} conf={result['confidence']} | {dbg[:260]}", flush=True)
     return JSONResponse(result, headers=CORS)
