@@ -221,7 +221,9 @@ class Engine:
         self.sent_stems = [set(toks(s)) for s in self.sents]
         # thresholds (tunable by env, differ for the fallback embedder)
         st = self.emb.kind != "tfidf"
-        self.dense_min = float(os.getenv("DENSE_MIN", 0.33 if st else 0.12))
+        self.dense_min = float(os.getenv("DENSE_MIN", 0.22 if st else 0.12))
+        # very strong semantic match answers even when wording differs from the passage (paraphrased questions)
+        self.dense_hi = float(os.getenv("DENSE_HI", 0.62 if st else 9.0))
         self.cov_min = float(os.getenv("COV_MIN", 0.6))
         self.cache = lru_cache(maxsize=1024)(self._answer)
 
@@ -331,7 +333,7 @@ class Engine:
                 cov = 1.0
             digit_ok = (not needs_num) or any(re.search(r"\d", self.sents[c]) for c in chosen)
             need = 1.0 if len(keys) == 1 else self.cov_min
-            good = (cov >= need and digit_ok) if keys else has_subject
+            good = ((cov >= need or ds[best] >= self.dense_hi) and digit_ok) if keys else has_subject
             if good:
                 picks.append((pi, chosen, cov))
 
