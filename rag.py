@@ -138,7 +138,7 @@ GROUPS = [
 ]
 NUMERIC_ATTR = set(map(stem, "size count amount value number level degree".split()))
 NUM_ASK = set(map(stem, """port threshold ratio size quorum timeout interval duration bit count limit latency window
-length rate many much heartbeat lease retry retries batch chunk""".split()))
+length rate many much heartbeat lease retry retries batch chunk millis second minute""".split()))
 
 INJ = re.compile(
     r"(ignore|disregard|forget|override|bypass)\b.{0,40}\b(instruction|prompt|rule|above|previous|prior|system|context|"
@@ -153,7 +153,9 @@ INJ = re.compile(
 
 
 def sanitize(question):
-    q = question[:2000].replace("\r", "\n")
+    q = question[:3000].replace("\r", "\n")
+    q = re.sub(r"<!--.*?(-->|$)", " ", q, flags=re.S)      # hidden HTML comments
+    q = re.sub(r"<\s*(script|style)[^>]*>.*?(<\s*/\s*\1\s*>|$)", " ", q, flags=re.S | re.I)
     keep = []
     for seg in re.split(r"\n+|(?<=[.?!])\s+", q):
         m = INJ.search(seg)
@@ -224,6 +226,8 @@ class Engine:
         self.dense_min = float(os.getenv("DENSE_MIN", 0.22 if st else 0.12))
         # very strong semantic match answers even when wording differs from the passage (paraphrased questions)
         self.dense_hi = float(os.getenv("DENSE_HI", 0.62 if st else 9.0))
+        # lower bar, only for "what is the <number>" questions that name no known subject
+        self.dense_lo = float(os.getenv("DENSE_LO", 0.40 if st else 9.0))
         self.cov_min = float(os.getenv("COV_MIN", 0.6))
         self.cache = lru_cache(maxsize=1024)(self._answer)
 
@@ -252,17 +256,21 @@ class Engine:
             got += ok
         return got / len(keys)
 
-    def _abstain(self, rank=0.0):
+    def _abstain(self, rank=0.0, dbg=""):
         return {"answer": None, "sources": [], "scores": [],
-                "confidence": round(0.05 + 0.25 * float(min(1.0, rank)), 4)}
+                "confidence": round(0.05 + 0.25 * float(min(1.0, rank)), 4), "_dbg": dbg}
 
     # ---- main
-    def answer(self, question, top_k=3):
+    def answer(self, question, top_k=3, debug=False):
         try:
             top_k = max(1, min(int(top_k), 10))
         except Exception:
             top_k = 3
-        return dict(self.cache((question or "").strip(), top_k))
+        r = dict(self.cache((question or "").strip(), top_k))
+        dbg = r.pop("_dbg", "")
+        if debug:
+            r["_dbg"] = dbg
+        return r
 
     def _answer(self, question, top_k):
         q = sanitize(question)
@@ -301,6 +309,7 @@ class Engine:
         cands = strong if compare else [int(order[0])] + ([int(order[1])] if rank[order[1]] >= 0.92 * rank[order[0]] else [])
 
         picks = []  # (passage, [sentence idxs], coverage)
+        dbg = []
         for pi in cands:
             idxs = list(np.where(self.owner == pi)[0])
             best, best_sc, best_cov = None, -1, 0.0
@@ -333,12 +342,32 @@ class Engine:
                 cov = 1.0
             digit_ok = (not needs_num) or any(re.search(r"\d", self.sents[c]) for c in chosen)
             need = 1.0 if len(keys) == 1 else self.cov_min
-            good = ((cov >= need or ds[best] >= self.dense_hi) and digit_ok) if keys else has_subject
+            other = ds[self.owner != pi].max() if (self.owner != pi).any() else 0.0
+            sem = (not has_subject) and (ds[best] >= self.dense_hi or
+                                         (needs_num and ds[best] >= self.dense_lo and ds[best] - other >= 0.02))
+            good = ((cov >= need or sem) and digit_ok) if keys else has_subject
+            dbg.append(f"p{pi}:s{best}:ds={ds[best]:.2f}:cov={cov:.2f}:oth={other:.2f}")
             if good:
                 picks.append((pi, chosen, cov))
 
+        def pass_cov(pi):
+            ids = np.where(self.owner == pi)[0]
+            return float(np.mean([any(self._coverage([k], i) >= 1 for i in ids) for k in keys])) if keys else 1.0
+
+        # synthesis questions name several subjects: each named subject contributes its most relevant
+        # sentences, but only when the question is long/rich enough or clearly matches those passages
+        if compare and (len(keys) >= 6 or max(pass_cov(pi) for pi in cands) >= 0.5):
+            have = {p[0] for p in picks}
+            for pi in cands:
+                if pi in have:
+                    continue
+                idxs = list(np.where(self.owner == pi)[0])
+                top = sorted(idxs, key=lambda i: -(0.6 * ds[i] + 0.4 * min(1.0, lex_s[i] * 1.5)))[:2]
+                picks.append((pi, sorted(int(t) for t in top), 0.5))
+            picks.sort(key=lambda p: cands.index(p[0]))
+
         if not picks:
-            return self._abstain(rank.max())
+            return self._abstain(rank.max(), f"subj={has_subject} num={needs_num} keys={keys} " + " ".join(dbg))
 
         if not keys:
             picks = [(pi, [int(np.where(self.owner == pi)[0][0])], 1.0) for pi, _, _ in picks]
@@ -357,4 +386,5 @@ class Engine:
         cov = float(np.mean([p[2] for p in picks]))
         conf = 0.62 + 0.36 * min(1.0, 0.5 * cov + 0.5 * min(1.0, rank[used[0]] / 0.9))
         return {"answer": answer, "sources": [int(i) for i in ordr], "scores": scores,
-                "confidence": round(float(min(0.98, conf)), 4)}
+                "confidence": round(float(min(0.98, conf)), 4),
+                "_dbg": f"subj={has_subject} num={needs_num} keys={keys} " + " ".join(dbg)}
