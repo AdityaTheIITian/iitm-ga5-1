@@ -61,6 +61,32 @@ def normalize_paraphrase(q):
     return q
 
 
+# ---------------------------------------------------------------- false-premise handling
+# PREMISE_MODE controls what happens when a question opens with "Since/Given that ..." and states a
+# number that the matched passage does not contain (e.g. "Since Raft requires 100 nodes ...").
+#   answer  (default) -> current behaviour: answer from the KB, unchanged
+#   correct           -> answer from the KB but lead with a premise-mismatch notice and put the
+#                        sentence that contradicts the premise next to the sentence that answers it
+#   abstain           -> treat the question as unanswerable as posed
+PREMISE_MODE = os.getenv("PREMISE_MODE", "answer").strip().lower()
+PREMISE_RE = re.compile(r"^\s*(since|given that|given|assuming that|assuming|assume that|because|considering that)\b", re.I)
+NUM_RE = re.compile(r"\d+(?:\.\d+)?")
+
+
+def false_premise_numbers(q, passage_text):
+    """numbers asserted in a premise-style question that the passage does not contain"""
+    if not PREMISE_RE.search(q):
+        return []
+    pt = norm_text(passage_text)
+    return [n for n in NUM_RE.findall(norm_text(q))
+            if not re.search(r"(?<![\d.])" + re.escape(n) + r"(?!\d)", pt)]
+
+
+def split_premise(q):
+    i = q.find(",")
+    return (q[:i], q[i + 1:]) if i >= 0 else (q, q)
+
+
 # ---------------------------------------------------------------- subjects
 # index: (short name, strong regexes, weak regexes)
 A = {
@@ -280,6 +306,24 @@ class Engine:
         return {"answer": None, "sources": [], "scores": [],
                 "confidence": round(0.05 + 0.25 * float(min(1.0, rank)), 4), "_dbg": dbg}
 
+    def _premise_rewrite(self, q, pi, ignore, ds):
+        """returns a corrected answer string for a false-premise question, or None"""
+        idxs = list(np.where(self.owner == pi)[0])
+
+        def pick(txt, need_digit):
+            ks = [k for k in (stem(w) for w in TOKEN_RE.findall(norm_text(txt)))
+                  if k not in STOP and k not in ignore and not k[0].isdigit()]
+            cand = [i for i in idxs if not need_digit or re.search(r"\d", self.sents[i])]
+            return max(cand, key=lambda i: (self._coverage(ks, i), ds[i]), default=None)
+
+        prem, ask = split_premise(q)
+        a, b = pick(prem, True), pick(ask, False)
+        if a is None or b is None:
+            return None
+        chosen = sorted({a, b})
+        return ("The premise in the question does not match the knowledge base. "
+                + " ".join(self.sents[c] for c in chosen))
+
     # ---- main
     def answer(self, question, top_k=3, debug=False):
         try:
@@ -399,6 +443,16 @@ class Engine:
             answer = " ".join(self.sents[c] for c in picks[0][1])
 
         used = [p[0] for p in picks]
+        premise_note = ""
+        if PREMISE_MODE != "answer" and not compare and len(picks) == 1:
+            bad = false_premise_numbers(q, self.passages[used[0]])
+            if bad:
+                if PREMISE_MODE == "abstain":
+                    return self._abstain(rank.max(), f"false-premise abstain {bad}")
+                rew = self._premise_rewrite(q, used[0], ignore, ds)
+                if rew:
+                    answer = rew
+                    premise_note = f" premise={bad}"
         final = rank.copy()
         for pi in used:
             final[pi] += 0.25
@@ -408,4 +462,4 @@ class Engine:
         conf = 0.62 + 0.36 * min(1.0, 0.5 * cov + 0.5 * min(1.0, rank[used[0]] / 0.9))
         return {"answer": answer, "sources": [int(i) for i in ordr], "scores": scores,
                 "confidence": round(float(min(0.98, conf)), 4),
-                "_dbg": f"subj={has_subject} num={needs_num} keys={keys} " + " ".join(dbg)}
+                "_dbg": f"subj={has_subject} num={needs_num} keys={keys} " + " ".join(dbg) + premise_note}
