@@ -64,12 +64,12 @@ def normalize_paraphrase(q):
 # ---------------------------------------------------------------- false-premise handling
 # PREMISE_MODE controls what happens when a question opens with "Since/Given that ..." and states a
 # number that the matched passage does not contain (e.g. "Since Raft requires 100 nodes ...").
-#   answer  (default) -> current behaviour: answer from the KB, unchanged
-#   correct           -> answer from the KB but lead with a premise-mismatch notice and put the
+#   answer            -> old behaviour: answer from the KB, unchanged
+#   correct (default) -> answer from the KB but lead with a premise-mismatch notice and put the
 #                        sentence that contradicts the premise next to the sentence that answers it
 #   abstain           -> treat the question as unanswerable as posed
-PREMISE_MODE = os.getenv("PREMISE_MODE", "answer").strip().lower()
-PREMISE_RE = re.compile(r"^\s*(since|given that|given|assuming that|assuming|assume that|because|considering that)\b", re.I)
+PREMISE_MODE = os.getenv("PREMISE_MODE", "correct").strip().lower()
+PREMISE_RE = re.compile(r"^\s*(since|given that|given|assuming that|assuming|assume that|suppose that|suppose|because|considering that|knowing that|if)\b", re.I)
 NUM_RE = re.compile(r"\d+(?:\.\d+)?")
 
 
@@ -321,7 +321,7 @@ class Engine:
         if a is None or b is None:
             return None
         chosen = sorted({a, b})
-        return ("The premise in the question does not match the knowledge base. "
+        return ("That premise is incorrect: it contradicts the knowledge base. According to the knowledge base: "
                 + " ".join(self.sents[c] for c in chosen))
 
     # ---- main
